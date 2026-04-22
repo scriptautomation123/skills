@@ -1,0 +1,55 @@
+{
+  "name": "skill-bridge",
+  "displayName": "Skill Bridge",
+  "description": "Local HTTP bridge that exposes VS Code's Copilot Language Model API to external tools",
+  "version": "0.1.0",
+  "publisher": "skill-creator",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Skill Bridge",
+      "properties": {
+        "skillBridge.port": {
+          "type": "number",
+          "default": 7777,
+          "description": "Port for the local HTTP bridge (skill.py connects here)"
+        },
+        "skillBridge.modelFamily": {
+          "type": "string",
+          "default": "gpt-4o",
+          "description": "Copilot model family to use when not overridden by the caller"
+        },
+        "skillBridge.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Maximum tokens per request"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "skillBridge.showStatus",
+        "title": "Skill Bridge: Show Status"
+      },
+      {
+        "command": "skillBridge.restart",
+        "title": "Skill Bridge: Restart Server"
+      },
+      {
+        "command": "skillBridge.openPipeline",
+        "title": "Skill Bridge: Open Pipeline Runner",
+        "icon": "$(run-all)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "skillBridge.openPipeline" },
+        { "command": "skillBridge.showStatus" },
+        { "command": "skillBridge.restart" }
+      ]
+    }
+  }
+}

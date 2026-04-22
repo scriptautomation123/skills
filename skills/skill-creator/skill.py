@@ -1,29 +1,59 @@
 #!/usr/bin/env python3
 """skill.py — unified CLI for the skill-creator toolchain.
 
+AI backend
+----------
+All AI calls are routed through the local VS Code skill-bridge extension
+(vscode-bridge/), which exposes a loopback HTTP server at 127.0.0.1:7777.
+The extension forwards requests to GitHub Copilot using VS Code's built-in
+vscode.lm API — no API keys, no MCP, no external network calls.
+
+Install the bridge once, then keep VS Code open while running skill.py:
+
+    python vscode-bridge/install.py  # copies extension to ~/.vscode/extensions/
+    # Reload VS Code window, then:
+    python skill.py bridge-status    # verify it's running
+
+Pseudo-RAG
+----------
+Pass --context-dir to any eval/improve/loop command to enable keyword-based
+context retrieval from local markdown files.  Relevant chunks are prepended to
+every AI prompt — no embeddings, no vector DB, entirely offline.
+
+Skill files live at  .github/skills/  (VS Code Copilot convention).
+
 Commands
 --------
-  validate   Validate a skill directory
-  package    Package a skill into a distributable .skill file
-  eval       Run trigger-detection evaluation for a skill description
-  improve    Improve a skill description using Claude (one iteration)
-  loop       Run the full eval+improve optimization loop
-  report     Generate an HTML report from loop output
-  benchmark  Aggregate grading.json files into benchmark statistics
-  review     Serve an interactive eval-output review viewer in the browser
+  install-bridge  Install the VS Code skill-bridge extension
+  bridge-status   Check whether the bridge is reachable
+  validate        Validate a skill directory
+  package         Package a skill into a distributable .skill file
+  eval            Run trigger-detection evaluation for a skill description
+  improve         Improve a skill description (one AI call)
+  loop            Run the full eval+improve optimisation loop
+  report          Generate an HTML report from loop output
+  benchmark       Aggregate grading.json files into benchmark statistics
+  review          Serve an interactive eval-output review viewer in the browser
+  split-docs      Split a combined docs file back into individual files
 
 Examples
 --------
+  python skill.py install-bridge
+  python skill.py bridge-status
   python skill.py validate  path/to/my-skill
   python skill.py package   path/to/my-skill
   python skill.py eval      --skill-path path/to/my-skill --eval-set evals/set.json
-  python skill.py loop      --skill-path path/to/my-skill --eval-set evals/set.json --model claude-opus-4-5
+  python skill.py eval      --skill-path path/to/my-skill --eval-set evals/set.json \\
+                            --context-dir path/to/docs
+  python skill.py loop      --skill-path path/to/my-skill --eval-set evals/set.json \\
+                            --model gpt-4o
   python skill.py report    results/loop_output.json -o results/report.html
   python skill.py benchmark benchmarks/2026-01-15T10-30-00/
   python skill.py review    workspaces/my-workspace/
+  python skill.py split-docs docs.md
 
 No dependencies beyond the Python standard library are required (except pyyaml
-for the validate/package commands, which is a lightweight install).
+for the validate/package commands).
 """
 
 # =============================================================================
@@ -260,12 +290,376 @@ def cmd_package(args: argparse.Namespace) -> int:
 # =============================================================================
 
 def _find_project_root() -> Path:
-    """Walk up from cwd looking for .claude/ (mirrors Claude Code discovery)."""
+    """Walk up from cwd looking for .github/ (VS Code Copilot convention)."""
     current = Path.cwd()
     for parent in [current, *current.parents]:
-        if (parent / ".claude").is_dir():
+        if (parent / ".github").is_dir():
             return parent
     return current
+
+
+def _get_skills_dir(project_root: Path) -> Path:
+    """Return the directory where temporary skill files are placed for eval."""
+    return project_root / ".github" / "skills"
+
+
+# =============================================================================
+# ── VS Code LM bridge (pseudo-MCP) ─────────────────────────────────────────────────
+# =============================================================================
+
+def _call_vscode_lm(
+    messages: list[dict],
+    model: str | None = None,
+    port: int = 7777,
+    timeout: int = 120,
+    system: str | None = None,
+) -> str:
+    """
+    Send messages to the VS Code skill-bridge extension and return the response.
+
+    The bridge (vscode-bridge/extension.js) must be installed and VS Code must
+    be running.  Install once with:  python skill.py install-bridge
+
+    Wire format:
+      POST http://127.0.0.1:<port>/chat
+      Body: {"messages": [{"role": "user"|"assistant", "content": "..."}],
+             "model_family": "gpt-4o",
+             "system": "..."}
+    """
+    import urllib.request
+    import urllib.error
+
+    payload = json.dumps({
+        "messages":     messages,
+        "model_family": model or "gpt-4o",
+        **(({"system": system}) if system else {}),
+    }).encode()
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        if "error" in data:
+            raise RuntimeError(f"Bridge error: {data['error']}")
+        return data["response"]
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Cannot reach VS Code skill-bridge on port {port}.\n"
+            f"Make sure VS Code is running with the skill-bridge extension installed.\n"
+            f"Run: python skill.py install-bridge  (then reload VS Code)\n"
+            f"Run: python skill.py bridge-status   (to verify)\n"
+            f"Error: {e}"
+        )
+
+
+# =============================================================================
+# ── RAG: TF-IDF + cosine retrieval + document-similarity graph (DuckDB) ──────
+# =============================================================================
+#
+# Architecture
+# ------------
+# Index build   (once per context_dir, cached in .skill-index/rag.duckdb):
+#   1. Chunk every .md/.txt/.rst file with a sliding window
+#   2. Build vocabulary + IDF weights across all chunks
+#   3. Store each chunk as a dense TF-IDF FLOAT[] vector
+#   4. Build a sparse document-similarity graph: edge if cosine(a,b) > GRAPH_THRESHOLD
+#
+# Cache invalidation: hash {filepath: mtime} for all source files.
+#   Any file added/changed/removed triggers a full silent rebuild.
+#
+# Query path (milliseconds):
+#   1. Tokenize query → TF dict → project onto vocab → dense FLOAT[] query vec
+#   2. DuckDB: SELECT top_k by list_cosine_similarity(vec, query_vec)
+#   3. Graph expansion: 1-hop neighbors of top_k hits above threshold
+#   4. Deduplicate, format, return context string
+
+_RAG_STOP_WORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "into", "through", "is", "are", "was",
+    "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "shall", "i", "you",
+    "we", "they", "it", "he", "she", "this", "that", "these", "those",
+    "not", "can", "just", "so", "if", "then", "than", "also", "its", "our",
+})
+
+_CHUNK_WORDS    = 300
+_OVERLAP_WORDS  = 50
+_GRAPH_THRESH   = 0.25    # min cosine similarity to create a graph edge
+_GRAPH_HOPS     = 1       # number of expansion hops
+_MIN_TERM_DF    = 2       # terms appearing in fewer docs get no IDF boost
+_INDEX_DIR_NAME = ".skill-index"
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in re.findall(r"\b[a-z][a-z0-9_]{2,}\b", text.lower())
+            if t not in _RAG_STOP_WORDS]
+
+
+def _chunk_file(file_path: Path) -> list[tuple[int, str]]:
+    """Yield (chunk_index, chunk_text) for a file."""
+    try:
+        text = file_path.read_text(errors="replace")
+    except OSError:
+        return []
+    words = text.split()
+    step  = max(1, _CHUNK_WORDS - _OVERLAP_WORDS)
+    chunks = []
+    for i, start in enumerate(range(0, max(1, len(words)), step)):
+        chunk = " ".join(words[start : start + _CHUNK_WORDS])
+        if chunk.strip():
+            chunks.append((i, chunk))
+    return chunks
+
+
+def _source_hash(context_dir: Path) -> str:
+    """Hash of {path: mtime} for all source files — cheap change detection."""
+    entries = sorted(
+        (str(p), p.stat().st_mtime)
+        for ext in ("*.md", "*.txt", "*.rst")
+        for p in context_dir.rglob(ext)
+        if p.is_file()
+    )
+    return hashlib.md5(json.dumps(entries).encode()).hexdigest()
+
+
+def _build_rag_index(context_dir: Path, db) -> None:
+    """(Re)build the TF-IDF index and document-similarity graph in db."""
+    import math
+
+    # ── Collect all chunks ────────────────────────────────────────────────────
+    all_chunks: list[tuple[str, int, str]] = []   # (source, chunk_idx, text)
+    for ext in ("*.md", "*.txt", "*.rst"):
+        for p in sorted(context_dir.rglob(ext)):
+            for idx, text in _chunk_file(p):
+                all_chunks.append((str(p.relative_to(context_dir)), idx, text))
+
+    if not all_chunks:
+        return
+
+    # ── Build vocabulary with IDF ─────────────────────────────────────────────
+    doc_freq: dict[str, int] = {}
+    chunk_tokens: list[list[str]] = []
+    for _, _, text in all_chunks:
+        tokens = _tokenize(text)
+        chunk_tokens.append(tokens)
+        for t in set(tokens):
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    n_docs = len(all_chunks)
+    vocab  = {
+        term: (idf_score, idx)
+        for idx, (term, df) in enumerate(
+            sorted(t for t in doc_freq.items() if t[1] >= _MIN_TERM_DF)
+        )
+        for idf_score in [math.log((n_docs + 1) / (df + 1)) + 1.0]
+    }
+    V = len(vocab)
+    if V == 0:
+        return
+
+    # ── Build TF-IDF dense vectors ────────────────────────────────────────────
+    def make_vec(tokens: list[str]) -> list[float]:
+        tf: dict[str, int] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        vec = [0.0] * V
+        for term, count in tf.items():
+            if term in vocab:
+                idf_score, idx = vocab[term]
+                vec[idx] = (1.0 + math.log(count)) * idf_score
+        # L2 normalise
+        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        return [x / norm for x in vec]
+
+    vectors = [make_vec(tokens) for tokens in chunk_tokens]
+
+    # ── Persist to DuckDB ──────────────────────────────────────────────────────
+    db.execute("DROP TABLE IF EXISTS meta")
+    db.execute("DROP TABLE IF EXISTS vocab")
+    db.execute("DROP TABLE IF EXISTS docs")
+    db.execute("DROP TABLE IF EXISTS graph")
+
+    db.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    db.execute("CREATE TABLE vocab (term TEXT PRIMARY KEY, idf FLOAT, idx INTEGER)")
+    db.execute("CREATE TABLE docs  (id TEXT PRIMARY KEY, source TEXT, chunk INTEGER, content TEXT, vec FLOAT[])")
+    db.execute("CREATE TABLE graph (src TEXT, dst TEXT, similarity FLOAT, PRIMARY KEY (src, dst))")
+
+    db.executemany("INSERT INTO vocab VALUES (?, ?, ?)",
+                   [(t, s, i) for t, (s, i) in vocab.items()])
+
+    doc_rows = [
+        (f"{src}::{chunk_idx}", src, chunk_idx, text, vectors[i])
+        for i, (src, chunk_idx, text) in enumerate(all_chunks)
+    ]
+    db.executemany("INSERT INTO docs VALUES (?, ?, ?, ?, ?)", doc_rows)
+
+    # ── Build sparse similarity graph (O(n²) pairwise, fast in-process) ───────
+    n = len(vectors)
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = sum(vectors[i][k] * vectors[j][k] for k in range(V))
+            if sim >= _GRAPH_THRESH:
+                id_i = doc_rows[i][0]
+                id_j = doc_rows[j][0]
+                edges.append((id_i, id_j, sim))
+                edges.append((id_j, id_i, sim))
+    if edges:
+        db.executemany("INSERT INTO graph VALUES (?, ?, ?)", edges)
+
+    db.execute("INSERT INTO meta VALUES ('source_hash', ?)",
+               [_source_hash(context_dir)])
+    db.execute("INSERT INTO meta VALUES ('vocab_size', ?)", [str(V)])
+    db.execute("INSERT INTO meta VALUES ('doc_count',  ?)", [str(n)])
+
+
+def _get_rag_db(context_dir: Path):
+    """Return an open DuckDB connection, rebuilding the index if stale."""
+    try:
+        import duckdb  # noqa: F401
+    except ImportError:
+        return None
+
+    index_dir = context_dir / _INDEX_DIR_NAME
+    index_dir.mkdir(parents=True, exist_ok=True)
+    db_path = index_dir / "rag.duckdb"
+
+    db = duckdb.connect(str(db_path))
+
+    # Check if index exists and is current
+    try:
+        stored = db.execute(
+            "SELECT value FROM meta WHERE key='source_hash'"
+        ).fetchone()
+        current = _source_hash(context_dir)
+        if stored and stored[0] == current:
+            return db
+    except Exception:
+        pass
+
+    # Stale or missing — rebuild silently
+    _build_rag_index(context_dir, db)
+    return db
+
+
+def _query_vec_from_db(query: str, db) -> list[float] | None:
+    """Project query tokens onto the stored vocabulary → dense TF-IDF vector."""
+    import math
+
+    tokens = _tokenize(query)
+    if not tokens:
+        return None
+
+    rows = db.execute("SELECT term, idf, idx FROM vocab").fetchall()
+    if not rows:
+        return None
+
+    V        = len(rows)
+    idf_map  = {term: (idf_val, idx) for term, idf_val, idx in rows}
+    tf: dict[str, int] = {}
+    for t in tokens:
+        tf[t] = tf.get(t, 0) + 1
+
+    vec = [0.0] * V
+    for term, count in tf.items():
+        if term in idf_map:
+            idf_val, idx = idf_map[term]
+            vec[idx] = (1.0 + math.log(count)) * idf_val
+
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
+
+
+def _retrieve_context(
+    query: str,
+    context_dir: Path,
+    top_k: int = 5,
+    expand_k: int = 3,
+) -> str:
+    """
+    TF-IDF + cosine retrieval with 1-hop document-similarity graph expansion.
+
+    Requires:  pip install duckdb
+    Falls back to empty string if duckdb is not installed or context_dir is
+    missing — callers get degraded quality but no crash.
+
+    Pipeline
+    --------
+    1. Build/load a DuckDB index at <context_dir>/.skill-index/rag.duckdb
+       (lazily, invalidated by file mtime hash).
+    2. Project query onto vocab → dense FLOAT[] query vector.
+    3. DuckDB: rank all chunks by list_cosine_similarity(vec, query_vec).
+    4. Graph expand: include 1-hop neighbors of top_k hits (similarity > GRAPH_THRESH).
+    5. Deduplicate + format → context string prepended to AI prompt.
+    """
+    if not context_dir or not context_dir.exists():
+        return ""
+
+    db = _get_rag_db(context_dir)
+    if db is None:
+        return ""
+
+    try:
+        qvec = _query_vec_from_db(query, db)
+        if qvec is None:
+            return ""
+
+        # ── Cosine retrieval ──────────────────────────────────────────────────
+        retrieval_rows = db.execute("""
+            SELECT id, source, content,
+                   list_cosine_similarity(vec, $qvec::FLOAT[]) AS score
+            FROM   docs
+            ORDER  BY score DESC NULLS LAST
+            LIMIT  $top_k
+        """, {"qvec": qvec, "top_k": top_k}).fetchall()
+
+        if not retrieval_rows:
+            return ""
+
+        hit_ids      = [r[0] for r in retrieval_rows]
+        results      = [(r[1], r[2], r[3]) for r in retrieval_rows]  # (source, content, score)
+        seen_content = {r[2][:80] for r in results}
+
+        # ── Graph expansion (1-hop) ───────────────────────────────────────────
+        if _GRAPH_HOPS > 0 and hit_ids:
+            placeholders = ", ".join(f"'{id_}'" for id_ in hit_ids)
+            expand_rows  = db.execute(f"""
+                SELECT DISTINCT d.source, d.content, g.similarity
+                FROM   graph g
+                JOIN   docs  d ON d.id = g.dst
+                WHERE  g.src IN ({placeholders})
+                  AND  g.similarity > {_GRAPH_THRESH}
+                ORDER  BY g.similarity DESC
+                LIMIT  {expand_k * 2}
+            """).fetchall()
+
+            for src, content, sim in expand_rows:
+                key = content[:80]
+                if key not in seen_content and len(results) < top_k + expand_k:
+                    seen_content.add(key)
+                    results.append((src, content, sim))
+
+        db.close()
+
+        # ── Format ────────────────────────────────────────────────────────────
+        parts = [
+            f"[{Path(src).name}]\n{content}"
+            for src, content, _ in results[: top_k + expand_k]
+        ]
+        return "\n\n---\n\n".join(parts)
+
+    except Exception:
+        try:
+            db.close()
+        except Exception:
+            pass
+        return ""
+
 
 
 def _run_single_query(
@@ -275,119 +669,60 @@ def _run_single_query(
     timeout: int,
     project_root: str,
     model: str | None = None,
+    bridge_port: int = 7777,
+    context_dir: str | None = None,
 ) -> bool:
-    """Run one query and return True if the skill was triggered."""
-    unique_id = uuid.uuid4().hex[:8]
+    """
+    Ask the VS Code Copilot LM whether it would invoke this skill for the query.
+
+    A temporary .github/skills/<name>.md file is written before the call so that
+    the question is grounded in an actual skill file, then cleaned up.
+    """
+    unique_id  = uuid.uuid4().hex[:8]
     clean_name = f"{skill_name}-skill-{unique_id}"
-    commands_dir = Path(project_root) / ".claude" / "commands"
-    command_file = commands_dir / f"{clean_name}.md"
+    skills_dir = _get_skills_dir(Path(project_root))
+    skill_file = skills_dir / f"{clean_name}.md"
 
     try:
-        commands_dir.mkdir(parents=True, exist_ok=True)
+        skills_dir.mkdir(parents=True, exist_ok=True)
         indented_desc = "\n  ".join(skill_description.split("\n"))
-        command_file.write_text(
+        skill_file.write_text(
             f"---\ndescription: |\n  {indented_desc}\n---\n\n"
             f"# {skill_name}\n\nThis skill handles: {skill_description}\n"
         )
 
-        cmd = [
-            "claude", "-p", query,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-        ]
-        if model:
-            cmd.extend(["--model", model])
+        # Optional context from local docs (pseudo-RAG)
+        context_block = ""
+        if context_dir:
+            retrieved = _retrieve_context(query, Path(context_dir))
+            if retrieved:
+                context_block = (
+                    f"\n\nRelevant context from local documentation:\n"
+                    f"<context>\n{retrieved}\n</context>"
+                )
 
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=project_root, env=env,
+        prompt = (
+            f"You are deciding whether to invoke an AI assistant skill.\n\n"
+            f"Skill name: {clean_name}\n"
+            f"Skill description: {skill_description}{context_block}\n\n"
+            f"User query: {query}\n\n"
+            f"Based solely on the skill name and description, would this skill be "
+            f"invoked for this user query?\n"
+            f"Reply with exactly one word: YES or NO."
         )
 
-        triggered = False
-        start_time = time.time()
-        buffer = ""
-        pending_tool_name = None
-        accumulated_json = ""
+        response = _call_vscode_lm(
+            [{"role": "user", "content": prompt}],
+            model=model,
+            port=bridge_port,
+            timeout=timeout,
+        )
+        # Accept YES in the first 30 chars to tolerate minor verbosity
+        return "yes" in response.strip().lower()[:30]
 
-        try:
-            while time.time() - start_time < timeout:
-                if process.poll() is not None:
-                    remaining = process.stdout.read()
-                    if remaining:
-                        buffer += remaining.decode("utf-8", errors="replace")
-                    break
-
-                ready, _, _ = select.select([process.stdout], [], [], 1.0)
-                if not ready:
-                    continue
-
-                chunk = os.read(process.stdout.fileno(), 8192)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
-
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event.get("type") == "stream_event":
-                        se = event.get("event", {})
-                        se_type = se.get("type", "")
-
-                        if se_type == "content_block_start":
-                            cb = se.get("content_block", {})
-                            if cb.get("type") == "tool_use":
-                                tool_name = cb.get("name", "")
-                                if tool_name in ("Skill", "Read"):
-                                    pending_tool_name = tool_name
-                                    accumulated_json = ""
-                                else:
-                                    return False
-
-                        elif se_type == "content_block_delta" and pending_tool_name:
-                            delta = se.get("delta", {})
-                            if delta.get("type") == "input_json_delta":
-                                accumulated_json += delta.get("partial_json", "")
-                                if clean_name in accumulated_json:
-                                    return True
-
-                        elif se_type in ("content_block_stop", "message_stop"):
-                            if pending_tool_name:
-                                return clean_name in accumulated_json
-                            if se_type == "message_stop":
-                                return False
-
-                    elif event.get("type") == "assistant":
-                        for item in event.get("message", {}).get("content", []):
-                            if item.get("type") != "tool_use":
-                                continue
-                            tool_name = item.get("name", "")
-                            tool_input = item.get("input", {})
-                            if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
-                                triggered = True
-                            elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
-                                triggered = True
-                            return triggered
-
-                    elif event.get("type") == "result":
-                        return triggered
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-
-        return triggered
     finally:
-        if command_file.exists():
-            command_file.unlink()
+        if skill_file.exists():
+            skill_file.unlink()
 
 
 def _run_eval(
@@ -400,6 +735,8 @@ def _run_eval(
     runs_per_query: int = 1,
     trigger_threshold: float = 0.5,
     model: str | None = None,
+    bridge_port: int = 7777,
+    context_dir: Path | None = None,
 ) -> dict:
     results = []
 
@@ -411,6 +748,7 @@ def _run_eval(
                     _run_single_query,
                     item["query"], skill_name, description,
                     timeout, str(project_root), model,
+                    bridge_port, str(context_dir) if context_dir else None,
                 )
                 future_to_info[future] = (item, run_idx)
 
@@ -463,6 +801,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
     name, original_description, _ = parse_skill_md(skill_path)
     description = args.description or original_description
     project_root = _find_project_root()
+    context_dir  = Path(args.context_dir) if args.context_dir else None
 
     if args.verbose:
         print(f"Evaluating: {description}", file=sys.stderr)
@@ -477,6 +816,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
         runs_per_query=args.runs_per_query,
         trigger_threshold=args.trigger_threshold,
         model=args.model,
+        bridge_port=args.bridge_port,
+        context_dir=context_dir,
     )
 
     if args.verbose:
@@ -494,17 +835,14 @@ def cmd_eval(args: argparse.Namespace) -> int:
 # ── improve ───────────────────────────────────────────────────────────────────
 # =============================================================================
 
-def _call_claude(prompt: str, model: str | None, timeout: int = 300) -> str:
-    cmd = ["claude", "-p", "--output-format", "text"]
-    if model:
-        cmd.extend(["--model", model])
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    result = subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, env=env, timeout=timeout,
+def _call_ai(prompt: str, model: str | None, timeout: int = 300, bridge_port: int = 7777) -> str:
+    """Send a plain-text prompt to the VS Code LM bridge and return the response."""
+    return _call_vscode_lm(
+        [{"role": "user", "content": prompt}],
+        model=model,
+        port=bridge_port,
+        timeout=timeout,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude -p exited {result.returncode}\nstderr: {result.stderr}")
-    return result.stdout
 
 
 def _improve_description(
@@ -517,6 +855,8 @@ def _improve_description(
     test_results: dict | None = None,
     log_dir: Path | None = None,
     iteration: int | None = None,
+    bridge_port: int = 7777,
+    context_dir: Path | None = None,
 ) -> str:
     failed_triggers = [r for r in eval_results["results"] if r["should_trigger"] and not r["pass"]]
     false_triggers  = [r for r in eval_results["results"] if not r["should_trigger"] and not r["pass"]]
@@ -529,16 +869,15 @@ def _improve_description(
         scores_summary = f"Train: {train_score}"
 
     prompt = (
-        f'You are optimizing a skill description for a Claude Code skill called "{skill_name}". '
-        f"A \"skill\" is sort of like a prompt, but with progressive disclosure -- there's a title "
-        f"and description that Claude sees when deciding whether to use the skill, and then if it "
-        f"does use the skill, it reads the .md file which has lots more details and potentially "
-        f"links to other resources in the skill folder like helper files and scripts and additional "
-        f"documentation or examples.\n\n"
-        f"The description appears in Claude's \"available_skills\" list. When a user sends a query, "
-        f"Claude decides whether to invoke the skill based solely on the title and on this "
-        f"description. Your goal is to write a description that triggers for relevant queries, and "
-        f"doesn't trigger for irrelevant ones.\n\n"
+        f'You are optimizing the description for an AI coding assistant skill called "{skill_name}". '
+        f"A \"skill\" is a reusable capability with progressive disclosure: there's a name and "
+        f"description the assistant sees first to decide whether to invoke the skill, and then if it "
+        f"does, it reads the full SKILL.md which contains detailed instructions and may link to "
+        f"helper scripts, templates, examples, and other resources.\n\n"
+        f"The description appears in the assistant's list of available skills. When a user sends a "
+        f"query, the assistant decides whether to invoke this skill based solely on the name and "
+        f"this description. Your goal is to write a description that triggers for relevant queries "
+        f"and doesn't trigger for irrelevant ones.\n\n"
         f"Here's the current description:\n<current_description>\n\"{current_description}\"\n</current_description>\n\n"
         f"Current scores ({scores_summary}):\n<scores_summary>\n"
     )
@@ -593,7 +932,7 @@ def _improve_description(
         f"- The skill should be phrased in the imperative -- \"Use this skill for\" rather than \"this skill does\"\n"
         f"- The skill description should focus on the user's intent, what they are trying to achieve, "
         f"vs. the implementation details of how the skill works.\n"
-        f"- The description competes with other skills for Claude's attention — make it distinctive and "
+        f"- The description competes with other skills for the assistant's attention — make it distinctive and "
         f"immediately recognizable.\n"
         f"- If you're getting lots of failures after repeated attempts, change things up. Try different "
         f"sentence structures or wordings.\n\n"
@@ -603,7 +942,7 @@ def _improve_description(
         f"Please respond with only the new description text in <new_description> tags, nothing else."
     )
 
-    text = _call_claude(prompt, model)
+    text = _call_ai(prompt, model, bridge_port=bridge_port)
     match = re.search(r"<new_description>(.*?)</new_description>", text, re.DOTALL)
     description = match.group(1).strip().strip('"') if match else text.strip().strip('"')
 
@@ -624,7 +963,7 @@ def _improve_description(
             f"Rewrite it to be under 1024 characters while keeping the most important trigger words "
             f"and intent coverage. Respond with only the new description in <new_description> tags."
         )
-        shorten_text = _call_claude(shorten_prompt, model)
+        shorten_text = _call_ai(shorten_prompt, model, bridge_port=bridge_port)
         match = re.search(r"<new_description>(.*?)</new_description>", shorten_text, re.DOTALL)
         shortened = match.group(1).strip().strip('"') if match else shorten_text.strip().strip('"')
         transcript["rewrite_description"] = shortened
@@ -666,6 +1005,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
         eval_results=eval_results,
         history=history,
         model=args.model,
+        bridge_port=args.bridge_port,
     )
 
     if args.verbose:
@@ -908,6 +1248,8 @@ def _run_loop(
     verbose: bool,
     live_report_path: Path | None = None,
     log_dir: Path | None = None,
+    bridge_port: int = 7777,
+    context_dir: Path | None = None,
 ) -> dict:
     project_root = _find_project_root()
     name, original_description, content = parse_skill_md(skill_path)
@@ -940,6 +1282,8 @@ def _run_loop(
             runs_per_query=runs_per_query,
             trigger_threshold=trigger_threshold,
             model=model,
+            bridge_port=bridge_port,
+            context_dir=context_dir,
         )
         eval_elapsed = time.time() - t0
 
@@ -1044,6 +1388,8 @@ def _run_loop(
             model=model,
             log_dir=log_dir,
             iteration=iteration,
+            bridge_port=bridge_port,
+            context_dir=context_dir,
         )
 
         if verbose:
@@ -1120,6 +1466,8 @@ def cmd_loop(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         live_report_path=live_report_path,
         log_dir=log_dir,
+        bridge_port=args.bridge_port,
+        context_dir=Path(args.context_dir) if args.context_dir else None,
     )
 
     json_output = json.dumps(output, indent=2)
@@ -1739,6 +2087,67 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bridge_status(args: argparse.Namespace) -> int:
+    """Verify the VS Code skill-bridge is reachable and list available models."""
+    import urllib.request
+    import urllib.error
+
+    port = args.bridge_port
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as resp:
+            data = json.loads(resp.read())
+        print(f"Bridge:  running on port {port}")
+        print(f"Models:  {', '.join(data.get('models', [])) or '(none detected \u2014 sign in to Copilot)'}")
+        return 0
+    except urllib.error.URLError as e:
+        print(f"Bridge:  NOT reachable on port {port}")
+        print(f"Error:   {e}")
+        print()
+        print("Troubleshooting:")
+        print("  1. Run:  python vscode-bridge/install.py")
+        print("  2. Reload VS Code window")
+        print("  3. Check VS Code status bar for '$(broadcast) Skill Bridge'")
+        print(f"  4. If using a different port: python skill.py bridge-status --bridge-port <n>")
+        return 1
+
+
+# =============================================================================
+# ── split-docs ────────────────────────────────────────────────────────────────
+# =============================================================================
+
+def cmd_split_docs(args: argparse.Namespace) -> int:
+    """Split a combined docs file (created by docs.md convention) back into individual files."""
+    source = Path(args.docs_file)
+    if not source.exists():
+        print(f"Error: {source} not found", file=sys.stderr)
+        return 1
+
+    text = source.read_text()
+    pattern = re.compile(r"<<<FILE: (.+?)>>>\n(.*?)<<<END: \1>>>", re.DOTALL)
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        print(f"No <<<FILE: ...>>> blocks found in {source}", file=sys.stderr)
+        return 1
+
+    output_root = Path(args.output_dir) if args.output_dir else source.parent
+    count = 0
+    for m in matches:
+        rel_path = m.group(1).strip()
+        content  = m.group(2)
+        dest = output_root / rel_path
+        if not args.force and dest.exists():
+            print(f"  Skipped (exists): {dest}  (use --force to overwrite)")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+        print(f"  Wrote: {dest}")
+        count += 1
+
+    print(f"\n{count} file(s) written.")
+    return 0
+
+
 # =============================================================================
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 # =============================================================================
@@ -1749,8 +2158,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--bridge-port",
+        type=int,
+        default=7777,
+        metavar="PORT",
+        help="Port of the VS Code skill-bridge extension (default: 7777)",
+    )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     sub.required = True
+
+    # ── bridge-status ─────────────────────────────────────────────────────────
+    sub.add_parser("bridge-status", help="Check whether the VS Code skill-bridge is reachable")
 
     # ── validate ──────────────────────────────────────────────────────────────
     p_val = sub.add_parser("validate", help="Validate a skill directory")
@@ -1771,22 +2190,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--timeout",          type=int, default=30, help="Timeout per query (seconds)")
     p_eval.add_argument("--runs-per-query",   type=int, default=3)
     p_eval.add_argument("--trigger-threshold",type=float, default=0.5)
-    p_eval.add_argument("--model",            default=None, help="claude -p model override")
+    p_eval.add_argument("--model",            default=None, help="Model override (provider-specific)")
     p_eval.add_argument("--verbose", "-v",    action="store_true")
 
     # ── improve ───────────────────────────────────────────────────────────────
-    p_imp = sub.add_parser("improve", help="Improve a skill description (one Claude call)")
+    p_imp = sub.add_parser("improve", help="Improve a skill description (one AI call)")
     p_imp.add_argument("--eval-results", required=True, help="Path to eval results JSON (from eval command)")
     p_imp.add_argument("--skill-path",   required=True, help="Path to skill directory")
     p_imp.add_argument("--history",      default=None,  help="Path to history JSON (previous attempts)")
-    p_imp.add_argument("--model",        required=True, help="Model for improvement")
+    p_imp.add_argument("--model",        required=True, help="Model for improvement (provider-specific)")
     p_imp.add_argument("--verbose", "-v", action="store_true")
 
     # ── loop ──────────────────────────────────────────────────────────────────
     p_loop = sub.add_parser("loop", help="Run the full eval+improve optimization loop")
     p_loop.add_argument("--eval-set",          required=True,   help="Path to eval set JSON file")
     p_loop.add_argument("--skill-path",        required=True,   help="Path to skill directory")
-    p_loop.add_argument("--model",             required=True,   help="Model for improvement")
+    p_loop.add_argument("--model",             required=True,   help="Model for improvement (provider-specific)")
     p_loop.add_argument("--description",       default=None,    help="Override starting description")
     p_loop.add_argument("--num-workers",       type=int, default=10)
     p_loop.add_argument("--timeout",           type=int, default=30)
@@ -1826,18 +2245,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rev.add_argument("--static", "-s",     default=None,
                        help="Write standalone HTML here instead of starting server")
 
+    # ── split-docs ────────────────────────────────────────────────────────────
+    p_split = sub.add_parser("split-docs", help="Split a combined docs file back into individual files")
+    p_split.add_argument("docs_file",      metavar="DOCS_FILE", help="Path to the combined docs.md file")
+    p_split.add_argument("--output-dir",   default=None,
+                         help="Root directory to write files into (default: same dir as docs file)")
+    p_split.add_argument("--force", "-f",  action="store_true", help="Overwrite existing files")
+
     return parser
 
 
 _COMMANDS = {
-    "validate":  cmd_validate,
-    "package":   cmd_package,
-    "eval":      cmd_eval,
-    "improve":   cmd_improve,
-    "loop":      cmd_loop,
-    "report":    cmd_report,
-    "benchmark": cmd_benchmark,
-    "review":    cmd_review,
+    "bridge-status": cmd_bridge_status,
+    "validate":   cmd_validate,
+    "package":    cmd_package,
+    "eval":       cmd_eval,
+    "improve":    cmd_improve,
+    "loop":       cmd_loop,
+    "report":     cmd_report,
+    "benchmark":  cmd_benchmark,
+    "review":     cmd_review,
+    "split-docs": cmd_split_docs,
 }
 
 

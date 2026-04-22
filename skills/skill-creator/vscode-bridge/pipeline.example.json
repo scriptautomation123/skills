@@ -1,0 +1,56 @@
+{
+  "name": "Skill Eval Loop",
+  "entry": "validate",
+  "steps": {
+    "validate": {
+      "label": "Validate Skill",
+      "command": "python",
+      "args": ["skill.py", "validate", "."],
+      "workingDir": "${workspaceFolder}",
+      "onSuccess": "eval",
+      "onFailure": null,
+      "captureOutput": false
+    },
+    "eval": {
+      "label": "Run Eval",
+      "command": "python",
+      "args": [
+        "skill.py", "eval",
+        "--skill-path", ".",
+        "--eval-set",   "evals/set.json"
+      ],
+      "workingDir": "${workspaceFolder}",
+      "onSuccess": "loop",
+      "onFailure": "loop",
+      "captureOutput": true
+    },
+    "loop": {
+      "label": "Optimise Description",
+      "command": "python",
+      "args": [
+        "skill.py", "loop",
+        "--skill-path",     ".",
+        "--eval-set",       "evals/set.json",
+        "--max-iterations", "5",
+        "--model",          "gpt-4o"
+      ],
+      "workingDir": "${workspaceFolder}",
+      "onSuccess": "report",
+      "onFailure": null,
+      "captureOutput": true
+    },
+    "report": {
+      "label": "Generate Report",
+      "command": "python",
+      "args": [
+        "skill.py", "report",
+        "-",
+        "--output", "results/report.html"
+      ],
+      "workingDir": "${workspaceFolder}",
+      "onSuccess": null,
+      "onFailure": null,
+      "captureOutput": false
+    }
+  }
+}
